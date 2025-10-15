@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  flask-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: flask_ml_classifier
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./results:/app/results
+      - ./categorized_reviews.csv:/app/categorized_reviews.csv
+      - ./model_new.pkl:/app/model_new.pkl
+      - ./vectorizer_new.pkl:/app/vectorizer_new.pkl
+    environment:
+      - FLASK_APP=app.py
+      - FLASK_ENV=production
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    networks:
+      - flask-network
+
+networks:
+  flask-network:
+    driver: bridge
