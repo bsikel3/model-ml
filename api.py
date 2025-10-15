@@ -5,8 +5,19 @@ import os
 from datetime import datetime
 import json
 import csv
+from flask_cors import CORS
 
 app = Flask(__name__)
+
+
+# Konfigurasi CORS - Pilih salah satu metode di bawah:
+
+# METODE 1: Izinkan semua origin (untuk development)
+CORS(app)
+
+# METODE 2: Izinkan origin tertentu (lebih aman untuk production)
+CORS(app, resources={r"/*": {"origins": ["http://192.168.23.50:5001", "http://192.168.23.50:4001"]}})
+
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['RESULT_FOLDER'] = 'results'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -24,7 +35,6 @@ except Exception as e:
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    
     data = request.get_json()
     if not data or 'content' not in data:
         return jsonify({"error": "Harap sertakan field 'content'"}), 400
@@ -33,11 +43,38 @@ def predict():
     X = vectorizer.transform([text])
     prediction = model.predict(X)[0]
 
+    # Hitung confidence
+    confidence = None
+    debug_info = {}
+    
+    if hasattr(model, "decision_function"):
+        # Untuk LinearSVC
+        decision_scores = model.decision_function(X)
+        debug_info['has_decision_function'] = True
+        debug_info['decision_shape'] = str(decision_scores.shape)
+        
+        if decision_scores.ndim == 1:
+            # Binary classification
+            confidence = float(abs(decision_scores[0]))
+            debug_info['classification_type'] = 'binary'
+        else:
+            # Multi-class classification
+            confidence = float(max(decision_scores[0]))
+            debug_info['classification_type'] = 'multi-class'
+            debug_info['all_scores'] = [float(s) for s in decision_scores[0]]
+    elif hasattr(model, "predict_proba"):
+        # Untuk model dengan predict_proba
+        proba = model.predict_proba(X)[0]
+        confidence = float(proba[list(model.classes_).index(prediction)])
+        debug_info['has_predict_proba'] = True
+    else:
+        debug_info['error'] = 'Model tidak punya decision_function atau predict_proba'
+
     # Simpan ke history
     new_data = pd.DataFrame({
         'content': [text],
         'primary_category': [prediction],
-        'timestamp': [datetime.now().strftime('%Y-%m-%d %H:%M:%S')]
+        'confidence': [confidence],
     })
 
     if os.path.exists(CATEGORIZED_FILE):
@@ -50,8 +87,11 @@ def predict():
     return jsonify({
         "input": text,
         "predicted_category": prediction,
+        "confidence": confidence,
+        "debug": debug_info,
         "message": "Prediction saved to categorized_reviews.csv"
     })
+
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -82,10 +122,46 @@ def upload_file():
 
     # Prediksi kategori
     X = vectorizer.transform(df['content'].astype(str))
-    df['primary_category'] = model.predict(X)
+    predictions = model.predict(X)
 
-    # Hapus kolom timestamp, gunakan source
-    result_df = df[['content', 'primary_category', 'score', 'source']] if 'score' in df.columns else df[['content', 'primary_category', 'source']]
+    # Hitung confidence untuk setiap prediksi
+    confidences = []
+    
+    if hasattr(model, "decision_function"):
+        # Untuk LinearSVC, gunakan decision_function
+        decision_scores = model.decision_function(X)
+        
+        if decision_scores.ndim == 1:
+            # Binary classification
+            confidences = [float(abs(score)) for score in decision_scores]
+        else:
+            # Multi-class classification - ambil nilai maksimum per baris
+            confidences = [float(max(scores)) for scores in decision_scores]
+            
+    elif hasattr(model, "predict_proba"):
+        # Untuk model dengan predict_proba
+        proba = model.predict_proba(X)
+        confidences = [float(p[list(model.classes_).index(pred)]) for p, pred in zip(proba, predictions)]
+    else:
+        # Fallback jika tidak ada confidence
+        confidences = [None] * len(predictions)
+
+    # Assign hasil prediksi dan confidence
+    df['primary_category'] = predictions
+    df['confidence'] = confidences
+
+    # Susun kolom hasil akhir dengan urutan yang jelas
+    base_columns = ['content', 'primary_category', 'confidence']
+    
+    # Tambahkan kolom tambahan jika ada (score, source, dll)
+    optional_columns = []
+    if 'score' in df.columns:
+        optional_columns.append('score')
+    if 'source' in df.columns:
+        optional_columns.append('source')
+    
+    result_columns = base_columns + optional_columns
+    result_df = df[result_columns]
 
     # Simpan hasil klasifikasi
     result_filename = f"classified_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -100,13 +176,21 @@ def upload_file():
         combined = result_df
     combined.to_csv(CATEGORIZED_FILE, index=False)
 
-    # Preview data (tanpa timestamp)
+    # Preview data (10 baris pertama)
     preview_data = result_df.head(10).to_dict(orient='records')
+
+    # Statistik confidence
+    confidence_stats = {
+        "avg_confidence": float(df['confidence'].mean()) if df['confidence'].notna().any() else None,
+        "min_confidence": float(df['confidence'].min()) if df['confidence'].notna().any() else None,
+        "max_confidence": float(df['confidence'].max()) if df['confidence'].notna().any() else None,
+    }
 
     return jsonify({
         "message": "Klasifikasi berhasil",
         "result_file": result_filename,
         "total_rows": len(result_df),
+        "confidence_stats": confidence_stats,
         "preview": preview_data
     })
 
@@ -169,9 +253,13 @@ def dashboard():
     unique_categories = df['primary_category'].nunique() if 'primary_category' in df.columns else 0
     top_issue = df['primary_category'].mode()[0] if 'primary_category' in df.columns else None
 
+    # Hitung rata-rata confidence
+    avg_confidence = float(df['confidence'].mean()) if 'confidence' in df.columns and df['confidence'].notna().any() else None
+
     summary = {
         "total_reviews": total_reviews,
         "avg_rating": avg_rating,
+        "avg_confidence": avg_confidence,
         "unique_categories": unique_categories,
         "top_issue": top_issue,
     }
@@ -205,4 +293,4 @@ def upload_csv():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0', port=8000)
+    app.run(debug=True, host='0.0.0.0', port=4001)
